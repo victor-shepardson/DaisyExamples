@@ -8,12 +8,18 @@ using namespace daisy;
 using namespace daisysp;
 
 //TODO:
+// pitch shifter class
+// toggle to double pitch range
 // stereo spread instead of up/down?
-// dry knob
+//   freq up / pitch down?
+// toggle dry to pre-post saturation
+// LFO
+// saturator footswitch
 
 //immediate ideas:
-//phase fuzz
+// do something with phase fuzz?
 // pitch tracker
+// transient modulated delay
 
 //further ideas:
 //slow chroma decomp + fast transient separator?
@@ -150,12 +156,15 @@ CrossFade fader;
 bool bypassOn;
 
 //controls
-float shift_freq, env_shift_amt, drive, gain;
+float shift_freq, env_shift_amt, drive, gain, pitch, dry;
 
 //global for updating LEDs
 float phasor_freq;
 
 void UpdateControls();
+
+float pf_prev = 0;
+float shifted_pf = 0;
 
 void AudioCallback(float **in, float **out, size_t size)
 {
@@ -168,6 +177,34 @@ void AudioCallback(float **in, float **out, size_t size)
 
         // envelope follower
         float env = env_follow.Process(abs(quad));
+
+        // TEMP: PHASE FUZZ
+        float pf = -atan2(quad.imag(), quad.real())/PI_F;
+        float delta_pf = pf - pf_prev;
+        // unwrap phase
+        if (delta_pf < -1.f){
+          delta_pf += 2.f;
+        }
+        if (delta_pf > 1.f){
+          delta_pf -= 2.f;
+        }
+        delta_pf *= pitch;
+        shifted_pf += delta_pf;
+        shifted_pf = fmod(shifted_pf*0.5f+0.5f, 1.f)*2.f-1.f;
+        // if (shifted_pf > 1.f){
+        //   shifted_pf -=2.f;
+        // }
+        pf_prev = pf;
+        pf = shifted_pf;
+
+        // float ceiling = 1e-1;
+        // float noise_floor = 1e-3;
+        // float pf_env =
+        //   sqrt(max(0.f, env-noise_floor) / ceiling) * ceiling;
+        // out[0][i] = out[1][i] = pf * pf_env;
+        // continue;
+
+        quad = (cos(shifted_pf*PI_F) + 1.fi*sin(shifted_pf*PI_F))*abs(quad);
 
         //shift_env knob does nothing at 12:00
         //at negative values, shift is suppressed by envelope
@@ -208,8 +245,8 @@ void AudioCallback(float **in, float **out, size_t size)
           out[1][i] = in[1][i];
         }
         else{
-          out[0][i] = out_left * out_gain;
-          out[1][i] = out_right * out_gain;
+          out[0][i] = out_left * out_gain + dry*in[0][i];
+          out[1][i] = out_right * out_gain + dry*in[1][i];
         }
     }
 }
@@ -314,6 +351,9 @@ void UpdateControls()
     env_shift_amt = petal.GetKnobValue(DaisyPetal::KNOB_2)*2.f-1.f;
     drive = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_3)*4.f);
     gain = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_4)*8.f-4.f);
+    pitch = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_5)*4.f-2.f);
+    dry = pow(petal.GetKnobValue(DaisyPetal::KNOB_6), 4.f);
+
 
     //bypass switch
     if(petal.switches[0].RisingEdge())
