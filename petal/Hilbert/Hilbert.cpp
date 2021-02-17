@@ -25,7 +25,15 @@ using namespace daisysp;
 //slow chroma decomp + fast transient separator?
 
 template <typename T> int sgn(T val) {
-    return (T(0) < val) - (val < T(0));
+  return (T(0) < val) - (val < T(0));
+}
+
+template <typename T> T wrap(T val) {
+  if (val > T(1))
+    return val - T(2);
+  if (val < T(-1))
+    return val + T(2);
+  return val;
 }
 
 class QOsc
@@ -43,9 +51,9 @@ public:
   void Init(float sr, float freq=0.){
     sr_ = sr;
     state = complex<float>(1);
-    setFreq(freq);
+    SetFreq(freq);
   }
-  void setFreq(float freq){
+  void SetFreq(float freq){
     inc = pow(complex<float>(-1), freq/sr_);
   }
   complex<float> Process(){
@@ -153,18 +161,18 @@ QOsc quad_osc;
 Oscillator lfo;
 CrossFade fader;
 
-bool bypassOn;
+bool bypassOn, saturate, pitch_shift_env, lfo_enabled;
 
 //controls
-float shift_freq, env_shift_amt, drive, gain, pitch, dry;
+float shift_freq, env_shift_amt, drive, gain, pitch, dry, pitch_toggle;
 
 //global for updating LEDs
 float phasor_freq;
 
 void UpdateControls();
 
-float pf_prev = 0;
-float shifted_pf = 0;
+float phi_prev = 0;
+float shifted_phi = 0;
 
 void AudioCallback(float **in, float **out, size_t size)
 {
@@ -178,34 +186,6 @@ void AudioCallback(float **in, float **out, size_t size)
         // envelope follower
         float env = env_follow.Process(abs(quad));
 
-        // TEMP: PHASE FUZZ
-        float pf = -atan2(quad.imag(), quad.real())/PI_F;
-        float delta_pf = pf - pf_prev;
-        // unwrap phase
-        if (delta_pf < -1.f){
-          delta_pf += 2.f;
-        }
-        if (delta_pf > 1.f){
-          delta_pf -= 2.f;
-        }
-        delta_pf *= pitch;
-        shifted_pf += delta_pf;
-        shifted_pf = fmod(shifted_pf*0.5f+0.5f, 1.f)*2.f-1.f;
-        // if (shifted_pf > 1.f){
-        //   shifted_pf -=2.f;
-        // }
-        pf_prev = pf;
-        pf = shifted_pf;
-
-        // float ceiling = 1e-1;
-        // float noise_floor = 1e-3;
-        // float pf_env =
-        //   sqrt(max(0.f, env-noise_floor) / ceiling) * ceiling;
-        // out[0][i] = out[1][i] = pf * pf_env;
-        // continue;
-
-        quad = (cos(shifted_pf*PI_F) + 1.fi*sin(shifted_pf*PI_F))*abs(quad);
-
         //shift_env knob does nothing at 12:00
         //at negative values, shift is suppressed by envelope
         // at positive values, shift scales with envelope
@@ -215,11 +195,44 @@ void AudioCallback(float **in, float **out, size_t size)
         } else {
           shift_env = pow(2, env_shift_amt*3)*pow(env+1e-15, env_shift_amt*2);
         }
+        lfo.SetFreq(pow(2.f, shift_env*5.f-2.f));
+        lfo.SetAmp(pow(env,0.25f));
 
-        phasor_freq = shift_freq*shift_env;
 
+        // TEMP: PHASE FUZZ
+        float phi = -atan2(quad.imag(), quad.real())/PI_F;
+        float delta_phi = phi - phi_prev;
+        // unwrap phase
+        delta_phi = wrap(delta_phi);
+
+        float phi_mult = pow(2.f, pitch_shift_env?pitch*shift_env:pitch);
+        delta_phi *= phi_mult;
+
+        shifted_phi += delta_phi;
+        // shifted_phi = fmod(shifted_phi*0.5f+0.5f, 1.f)*2.f-1.f;
+        shifted_phi = wrap(shifted_phi);
+        // if (shifted_phi > 1.f){
+        //   shifted_phi -=2.f;
+        // }
+        phi_prev = phi;
+        phi = shifted_phi;
+
+        // float ceiling = 1e-1;
+        // float noise_floor = 1e-3;
+        // float phi_env =
+        //   sqrt(max(0.f, env-noise_floor) / ceiling) * ceiling;
+        // out[0][i] = out[1][i] = phi * phi_env;
+        // continue;
+
+        // TODO: wavetables/octave+ here?
+        quad = abs(quad)*(
+          cos(shifted_phi*PI_F*pitch_toggle) +
+          1.fi*sin(shifted_phi*PI_F*pitch_toggle)
+        );
+
+        phasor_freq = shift_freq*shift_env*(lfo_enabled?lfo.Process():1.f);
         // quadrature oscillator
-        quad_osc.setFreq(phasor_freq);
+        quad_osc.SetFreq(phasor_freq);
         complex<float> q = quad_osc.Process();
         // phasor.SetFreq(phasor_freq);
         // float phi = TWOPI_F*phasor.Process();
@@ -233,12 +246,20 @@ void AudioCallback(float **in, float **out, size_t size)
         // float shifted_up = quad.real()*q0 + quad.imag()*q1;
         // float shifted_down = quad.real()*q0 - quad.imag()*q1;
 
-        float saturate_level = 1e-1*(env+1.f/drive);
-        float sat_gain = drive/saturate_level;
-        float out_left = sin(sat_gain*shifted_up);
-        float out_right = sin(sat_gain*shifted_down);
-
-        float out_gain = saturate_level*gain;
+        //saturate
+        float out_gain, out_left, out_right;
+        if(saturate){
+          float saturate_level = 1e-1*(env+1.f/drive);
+          float sat_gain = drive/saturate_level;
+           out_left = sin(sat_gain*shifted_up);
+           out_right = sin(sat_gain*shifted_down);
+           out_gain = saturate_level*gain;
+         }
+         else{
+           out_left = shifted_up;
+           out_right = shifted_down;
+           out_gain = gain;
+         }
 
         if (bypassOn){
           out[0][i] = in[0][i];
@@ -264,6 +285,11 @@ int main(void)
     quad_osc.Init(samplerate, 0.);
     env_follow.Init(samplerate);
 
+    lfo.Init(samplerate);
+    lfo.SetAmp(1);
+    lfo.SetFreq(3);
+    lfo.SetWaveform(Oscillator::WAVE_SIN);
+
     petal.StartAdc();
     petal.StartAudio(AudioCallback);
 
@@ -273,7 +299,15 @@ int main(void)
     {
         petal.ClearLeds();
 
-        petal.SetFootswitchLed((DaisyPetal::FootswitchLed)0, !bypassOn);
+        petal.SetFootswitchLed(
+          (DaisyPetal::FootswitchLed)0, !bypassOn);
+        petal.SetFootswitchLed(
+          (DaisyPetal::FootswitchLed)1, petal.switches[1].Pressed());
+        petal.SetFootswitchLed(
+          (DaisyPetal::FootswitchLed)2, lfo_enabled);
+        petal.SetFootswitchLed(
+          (DaisyPetal::FootswitchLed)3, saturate);
+
 
         float ring_steps = frame_us * 1e-6 * abs(phasor_freq) * 8.f;
         float freq_color = sgn(phasor_freq) * log2(abs(phasor_freq)/30.f + 1.)/2.;
@@ -345,19 +379,44 @@ void UpdateControls()
     petal.ProcessAnalogControls();
 
     //knobs
+    gain = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_1)*8.f-4.f);
+    dry = pow(petal.GetKnobValue(DaisyPetal::KNOB_2), 4.f);
+
     //TODO: coarse/fine switch, linear region?
-    shift_freq = pow(petal.GetKnobValue(DaisyPetal::KNOB_1)*32.f-16.f, 3.0f);
-    // move sign to a switch
-    env_shift_amt = petal.GetKnobValue(DaisyPetal::KNOB_2)*2.f-1.f;
-    drive = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_3)*4.f);
-    gain = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_4)*8.f-4.f);
-    pitch = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_5)*4.f-2.f);
-    dry = pow(petal.GetKnobValue(DaisyPetal::KNOB_6), 4.f);
+    shift_freq =
+      pow(petal.GetKnobValue(DaisyPetal::KNOB_3)*16.f, 3.0f)
+      * (petal.switches[4].Pressed()?1:-1);
+    pitch =
+      petal.GetKnobValue(DaisyPetal::KNOB_4)
+      * (petal.switches[5].Pressed()?1:-1);
+
+    env_shift_amt = petal.GetKnobValue(DaisyPetal::KNOB_5)*2.f-1.f;
+    //switch 7
+    pitch_shift_env = petal.switches[6].Pressed();
 
 
-    //bypass switch
+    drive = pow(2., petal.GetKnobValue(DaisyPetal::KNOB_6)*4.f);
+
+    //switch 1: bypass
     if(petal.switches[0].RisingEdge())
     {
         bypassOn = !bypassOn;
     }
+
+    //switch 2: +octave
+    pitch_toggle = petal.switches[1].Pressed()?2.f:1.f;
+
+    //switch 3: lfo on/off
+    if(petal.switches[2].RisingEdge())
+    {
+        lfo_enabled = !lfo_enabled;
+    }
+
+    //switch 4: saturate on/off
+    if(petal.switches[3].RisingEdge())
+    {
+        saturate = !saturate;
+    }
+
+
 }
